@@ -1,1 +1,1 @@
-Basic scripts to assist in enumeration using nmap and netexec.
+Basic scripts to assist in enumeration using nmap,feroxbuster, and netexec.
