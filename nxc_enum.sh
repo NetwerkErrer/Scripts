@@ -124,27 +124,75 @@ section() {
 
 # ============================================================
 # extract_users <output_file>
-# Parses nxc user-enumeration output lines and appends unique
-# usernames to $USER_LIST. Handles both SMB and LDAP formats:
-#   SMB   10.x  445  HOST  [+] DOMAIN\username
-#   LDAP  10.x  389  HOST  [*] username  (badPwdCount=0 ...)
-#   RID   10.x  445  HOST  500: DOMAIN\Administrator (SidTypeUser)
+# Parses nxc output files and appends confirmed usernames to
+# _users_raw.txt. Handles three distinct nxc output formats:
+#
+# FORMAT 1 — smb --users:
+#   SMB  10.x  445  HOST  [+] DOMAIN\username  badpwdcount:0  desc:...
+#   logger.highlight() = [+], first token after tag is DOMAIN\username.
+#   Anchor: backslash present in the token immediately after [+].
+#
+# FORMAT 2 — ldap --users  (source: nxc ldap.py logger.highlight()):
+#   LDAP  10.x  389  HOST  [*] username    2024-01-15 09:00:00  0  desc
+#   LDAP  10.x  389  HOST  [*] krbtgt      <never>              0
+#   logger.highlight() = [*], fixed-width columns: sAMAccountName, then
+#   pwd_last_set, then badPwdCount, then description.
+#   Anchor: the field two positions after [*] is always a date (20xx-)
+#   or the literal "<never>" — this is the pwd_last_set column and is
+#   present on every user data line. Header and count lines never match.
+#
+# FORMAT 3 — --rid-brute:
+#   SMB  10.x  445  HOST  500: DOMAIN\Administrator (SidTypeUser)
+#   SMB  10.x  445  HOST  512: DOMAIN\Domain Admins (SidTypeGroup)
+#   Anchor: (SidTypeUser) at end of line. SidTypeGroup/Alias skipped.
 # ============================================================
 extract_users() {
     local src="$1"
     [ -f "$src" ] || return
 
-    grep -Pio \
-        '(?<=\\\)[\w\.\-]+(?=\s)' \
-        "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
+    # FORMAT 1: smb --users — [+] DOMAIN\username ...
+    awk '
+        /\[\+\]/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "[+]" && (i+1) <= NF) {
+                    token = $(i+1)
+                    if (index(token, "\\") > 0) {
+                        n = split(token, parts, "\\")
+                        if (parts[n] != "") print parts[n]
+                    }
+                    break
+                }
+            }
+        }
+    ' "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
 
-    # LDAP format: [*] username  or [+] username  (no backslash)
-    grep -Po '(?<=\[\*\]\s{1,6}|(?<=\[\+\]\s{1,6}))[\w\.\-]+(?=\s)' \
-        "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
+    # FORMAT 2: ldap --users — no tag, fixed columns:
+    #   LDAP  IP  PORT  HOST  username  date_or_never  badpw  [desc]
+    # Real output (from nxc source logger.highlight(), no [*]/[+] prefix):
+    #   LDAP  10.x  389  DC01  Administrator  2026-01-12 11:00:19  1  Built-in...
+    #   LDAP  10.x  389  DC01  mprice         2026-01-17 11:40:55  0
+    #   LDAP  10.x  389  DC01  krbtgt         <never>              0
+    # Anchor: $6 is the pwd_last_set column — always "20xx-" or "<never>".
+    # This excludes the header ($6 == "-Last"), count lines ($6 == "domain"),
+    # and all [*]/[+] tagged lines ($5 starts with "[").
+    awk '
+        ($6 ~ /^20[0-9][0-9]-/ || $6 == "<never>") && $5 !~ /^\[/ {
+            print $5
+        }
+    ' "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
 
-    # RID format: 500: DOMAIN\username (SidTypeUser)
-    grep -Pio '(?<=\\)[\w\.\-]+(?=\s+\(SidTypeUser\))' \
-        "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
+    # FORMAT 3: --rid-brute — NNN: DOMAIN\username (SidTypeUser)
+    awk '
+        /\(SidTypeUser\)/ {
+            for (i = 1; i <= NF; i++) {
+                if (index($i, "\\") > 0 && $i !~ /^\(/) {
+                    n = split($i, parts, "\\")
+                    if (parts[n] != "") print parts[n]
+                    break
+                }
+            }
+        }
+    ' "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
 }
 
 # ============================================================
@@ -688,8 +736,9 @@ run_nxc "Active sessions" \
     "${OUTPUT_DIR}/08_sessions" \
     smb "$TARGET" "${AUTH_ARGS[@]}" --sessions
 
-extract_users "${OUTPUT_DIR}/08_loggedon.txt"
-extract_users "${OUTPUT_DIR}/08_sessions.txt"
+# Note: --loggedon-users and --sessions use a different output format
+# (DOMAIN\username shown in a status line, not a [+] DOMAIN\user data line).
+# These are left as raw files for manual review rather than risking noise.
 
 # ============================================================
 # STAGE 9 — WINRM (if available)
@@ -711,7 +760,7 @@ run_nxc "LDAP info + DC detection" \
 
 run_nxc "LDAP users" \
     "${OUTPUT_DIR}/10_ldap_users" \
-    ldap "$TARGET" "${AUTH_ARGS[@]}" --users
+    ldap "$TARGET" "${AUTH_ARGS[@]}" --users --users-export "${OUTPUT_DIR}/usernames.txt"
 
 run_nxc "LDAP groups" \
     "${OUTPUT_DIR}/10_ldap_groups" \
@@ -729,14 +778,20 @@ run_nxc "Find AD CS (certificate services)" \
     "${OUTPUT_DIR}/10_adcs" \
     ldap "$TARGET" "${AUTH_ARGS[@]}" -M adcs
 
-# Feed Stage 10 LDAP user/group outputs
-extract_users  "${OUTPUT_DIR}/10_ldap_users.txt"
-extract_groups "${OUTPUT_DIR}/10_ldap_groups.txt" "LDAP-domain"
+# --users-export wrote usernames.txt directly — no parsing needed
+# Fall back to awk parser only if export produced nothing
+if [ -s "${OUTPUT_DIR}/usernames.txt" ]; then
+    echo -e "${GREEN}[+] usernames.txt written by nxc: ${OUTPUT_DIR}/usernames.txt${NC}"
+    echo -e "${CYAN}    Total: $(wc -l < "${OUTPUT_DIR}/usernames.txt") users${NC}"
+else
+    echo -e "${YELLOW}[!] --users-export produced no output, falling back to parser${NC}"
+    extract_users "${OUTPUT_DIR}/10_ldap_users.txt"
+fi
 
-# Final user + group list rebuild with all Stage 10 data
+# Feed Stage 10 LDAP group output and rebuild group list
+extract_groups "${OUTPUT_DIR}/10_ldap_groups.txt" "LDAP-domain"
 echo ""
-echo -e "${CYAN}[*] Final user & group list rebuild (post-LDAP)...${NC}"
-build_user_list
+echo -e "${CYAN}[*] Final group list rebuild (post-LDAP)...${NC}"
 build_group_list
 
 # ============================================================
@@ -803,15 +858,9 @@ run_nxc "NTDS.dit dump — Domain Controller only (requires DA)" \
     "${OUTPUT_DIR}/12_ntds" \
     smb "$TARGET" "${AUTH_ARGS[@]}" --ntds 2>/dev/null
 
-# Extract users from credential dumps — these are goldmines
-extract_users "${OUTPUT_DIR}/12_sam_dump.txt"
-extract_users "${OUTPUT_DIR}/12_lsa_dump.txt"
-extract_users "${OUTPUT_DIR}/12_ntds.txt"
-
-# Final rebuild after dump outputs
-echo ""
-echo -e "${CYAN}[*] Rebuilding user list with dump data...${NC}"
-build_user_list
+# Note: SAM/LSA/NTDS output is in credential dump format (user:RID:LM:NT:::),
+# not nxc --users format. Parse those manually with e.g.:
+#   awk -F: '{print $1}' 12_sam_dump.txt | grep -v '^#'
 
 # ============================================================
 # STAGE 13 — Useful Modules
@@ -927,6 +976,7 @@ echo "    - Review group members: cat ${OUTPUT_DIR}/06b_members_Domain_Admins.tx
 echo "    - Evil-WinRM:          evil-winrm -i ${TARGET} -u <user> -p <pass>"
 echo "    - Impacket PTH:        impacket-psexec <user>@${TARGET} -hashes :<NThash>"
 echo "    - BloodHound ingest:   bloodhound-python -u <user> -p <pass> -d <domain> -ns ${TARGET} -c all"
+echo "    - Create User List: 	 nxc ldap <target> -u <user> -p <pass> --users-export output.txt"
 echo "    - Password spray:      nxc smb ${TARGET} -u ${OUTPUT_DIR}/usernames.txt -p <password> --continue-on-success"
 echo ""
 echo -e "${GREEN}[+] All results saved to: ${OUTPUT_DIR}/${NC}"
